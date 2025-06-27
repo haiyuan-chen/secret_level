@@ -1,0 +1,5 @@
+pynput
+mss
+opencv-python
+pyserial
+numpy
