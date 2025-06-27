@@ -241,6 +241,10 @@ class TraversalStrategy(Strategy):
         self.target = end
         self.last_direction = None
 
+        # Navigation state
+        self.navigation_target = None
+        self.navigation_active = False
+
         now = time.perf_counter()
         self.next_blink = now + random.uniform(*self.blink_interval_range)
         self.next_jump = now + random.uniform(*self.jump_interval_range)
@@ -255,6 +259,53 @@ class TraversalStrategy(Strategy):
         if pos["x"] < 0:
             return []
 
+        # Check for puzzle trigger
+        puzzle_icon_detected = context.get("puzzle_icon", False)
+        if puzzle_icon_detected and not self.navigation_active:
+            purple_dots = context.get("purple_dots", [])
+            if purple_dots:
+                self.navigation_target = purple_dots[0]
+                self.navigation_active = True
+                logging.info(
+                    f"🎯 Puzzle detected! Navigating to {self.navigation_target}"
+                )
+
+        # Navigation mode (2D movement to purple dot)
+        if self.navigation_active and self.navigation_target:
+            target_x = self.navigation_target["x"]
+            target_y = self.navigation_target["y"]
+            current_x = pos["x"]
+            current_y = pos["y"]
+
+            distance_x = abs(current_x - target_x)
+            distance_y = abs(current_y - target_y)
+
+            # Check if reached
+            if distance_x <= 8 and distance_y <= 8:
+                logging.info("🎯 Reached puzzle location!")
+                self.navigation_active = False
+                self.navigation_target = None
+                # Fall through to normal patrol
+            else:
+                # Move in direction with largest distance
+                if distance_x > distance_y and distance_x > 5:
+                    direction = "right" if target_x > current_x else "left"
+                elif distance_y > 5:
+                    direction = "down" if target_y > current_y else "up"
+                else:
+                    direction = "right" if target_x > current_x else "left"
+
+                actions = [{"type": "traverse", "dir": direction}]
+
+                if self.last_direction != direction:
+                    logging.info(
+                        f"🧭 Navigating {direction} to ({target_x}, {target_y})"
+                    )
+                    self.last_direction = direction
+
+                return actions
+
+        # Normal patrol mode
         tx = self.target["x"]
         current_x = pos["x"]
 
@@ -315,7 +366,7 @@ class JumpComboStrategy(Strategy):
         self.combo_interval_range = combo_interval_range
         self.last_combo_time = 0
         self.combo_in_progress = False
-        self.combo_stage = 0  # 0=ready, 1-4=jumps, 5=attack
+        self.combo_stage = 0
         self.stage_start_time = 0
         self.stage_counter = 0
 
@@ -330,7 +381,6 @@ class JumpComboStrategy(Strategy):
         now = time.perf_counter()
         actions = []
 
-        # Start new combo
         if not self.combo_in_progress:
             self.combo_in_progress = True
             self.combo_stage = 1
@@ -341,24 +391,19 @@ class JumpComboStrategy(Strategy):
         if self.combo_in_progress:
             stage_elapsed = now - self.stage_start_time
 
-            # Jump stages 1-4 (spam jumps)
             if self.combo_stage <= 4:
                 actions.append({"type": "jump", "key": self.jump_key})
 
-                # Move to next stage every 40ms (very fast)
                 if stage_elapsed >= 0.04:
                     self.combo_stage += 1
                     self.stage_start_time = now
                     self.stage_counter += 1
                     logging.info(f"🦘 Jump {self.stage_counter}")
 
-            # Attack stage
             elif self.combo_stage == 5:
                 actions.append({"type": "attack", "key": self.attack_key})
 
-                # Hold attack for a bit longer
                 if stage_elapsed >= 0.08:
-                    # Combo complete
                     self.combo_in_progress = False
                     self.combo_stage = 0
                     self.last_combo_time = now
@@ -383,11 +428,9 @@ class HardwareExecutor:
         self.last_movement_command = 0
         self.last_action_command = 0
 
-        # Change these intervals to be much faster
-        self.movement_interval = 0.2  # Was 0.5, now 0.1 seconds
-        self.action_interval = 0.2  # Was 1.0, now 0.1 seconds
+        self.movement_interval = 0.2
+        self.action_interval = 0.2
 
-        # Add randomized intervals
         self.last_attack_interval = 0.15
         self.last_blink_interval = 0.3
 
@@ -411,7 +454,7 @@ class HardwareExecutor:
                     self.current_direction = direction
                     self.last_movement_command = now
 
-        # Handle action commands (attack, blink, jump) - let strategy decide
+        # Handle action commands
         action_commands = [
             a for a in actions if a["type"] in ["attack", "blink", "jump"]
         ]
@@ -425,7 +468,6 @@ class HardwareExecutor:
     def _send_command(self, command_dict: dict) -> bool:
         """Send command using Arduino-compatible format (no spaces)"""
         try:
-            # Create Arduino-compatible JSON format (no spaces)
             if command_dict["type"] == "traverse":
                 cmd = f'{{"type":"traverse","dir":"{command_dict["dir"]}"}}'
             elif command_dict["type"] == "release":
@@ -437,16 +479,13 @@ class HardwareExecutor:
             else:
                 cmd = json.dumps(command_dict)
 
-            # DEBUG: Always print what we're sending
-            print(f"🔧 DEBUG: Sending command: {cmd}")
-
             self.ser.write(f"{cmd}\n".encode())
             self.ser.flush()
             time.sleep(0.05)
             return True
 
         except Exception as e:
-            print(f"🔧 DEBUG: Send failed: {e}")
+            logging.error(f"Send failed: {e}")
             return False
 
     def stop_movement(self):
@@ -473,7 +512,14 @@ class BotEngine:
             cfg["dot_templates"], cfg["dot_threshold"]
         )
 
-        # ADD PUZZLE ICON DETECTOR HERE
+        # Purple dot detector for navigation
+        self.purple_detector = ColorDotDetector(
+            "purple_dots",
+            cfg.get("purple_hsv_lower", [120, 50, 50]),
+            cfg.get("purple_hsv_upper", [160, 255, 255]),
+        )
+
+        # Puzzle icon detector
         if cfg.get("puzzle_icon_region"):
             self.icon_detector = IconDetector(
                 cfg.get("puzzle_icon_templates", ["puzzle_icon_template.png"]),
@@ -486,7 +532,7 @@ class BotEngine:
 
         # Periodic detectors (every 3 frames)
         self.color_detectors = [
-            ColorDotDetector("red_dots", cfg["red_hsv_lower"], cfg["red_hsv_upper"]),
+            RedDotDetector(cfg["red_hsv_lower"], cfg["red_hsv_upper"]),
             ColorDotDetector(
                 "blue_dots",
                 cfg.get("blue_hsv_lower", [100, 50, 50]),
@@ -497,11 +543,6 @@ class BotEngine:
                 cfg.get("green_hsv_lower", [40, 50, 50]),
                 cfg.get("green_hsv_upper", [80, 255, 255]),
             ),
-            ColorDotDetector(
-                "purple_dots",
-                cfg.get("purple_hsv_lower", [120, 50, 50]),
-                cfg.get("purple_hsv_upper", [160, 255, 255]),
-            ),
         ]
 
         self.frame_count = 0
@@ -511,7 +552,6 @@ class BotEngine:
         traversal_mode = cfg.get("traversal_mode", "blink")
 
         if traversal_mode == "jump":
-            # Jump mode: Movement + Jump Combos (no separate combat)
             self.strategies: List[Strategy] = [
                 TraversalStrategy(
                     cfg["patrol_start"],
@@ -520,17 +560,16 @@ class BotEngine:
                     cfg.get("blink_key", "4"),
                     cfg.get("jump_key", " "),
                     cfg.get("blink_interval_range", [5, 10]),
-                    [0.2, 0.3],  # Very fast jump combos
+                    [0.2, 0.3],
                     cfg.get("switch_threshold", 5),
                 ),
                 JumpComboStrategy(
                     cfg.get("jump_key", " "),
                     cfg.get("attack_key", "a"),
-                    [0.2, 0.3],  # Every 200-300ms (much faster)
+                    [0.2, 0.3],
                 ),
             ]
         else:
-            # Blink mode: Movement + Blink + Separate Combat
             self.strategies: List[Strategy] = [
                 TraversalStrategy(
                     cfg["patrol_start"],
@@ -594,7 +633,10 @@ class BotEngine:
                 position = self.position_detector.detect(frame)
                 context["position"] = position
 
-                # ADD PUZZLE ICON DETECTION HERE
+                # Always detect purple dots (needed for navigation)
+                context["purple_dots"] = self.purple_detector.detect(frame)
+
+                # Puzzle icon detection
                 if self.icon_detector:
                     puzzle_icon_detected = self.icon_detector.detect(frame)
                     context["puzzle_icon"] = puzzle_icon_detected
@@ -603,14 +645,12 @@ class BotEngine:
 
                 # Detect colors every 3rd frame
                 if self.frame_count % 3 == 0:
-                    # Run all color detectors and cache results
                     for detector in self.color_detectors:
                         result = detector.detect(frame)
                         detector_name = detector.name()
                         self.cached_color_results[detector_name] = result
                         context[detector_name] = result
                 else:
-                    # Use cached results from previous detection
                     context.update(self.cached_color_results)
 
                 self.frame_count += 1
@@ -649,6 +689,11 @@ class BotEngine:
         if pos["x"] >= 0:
             cv2.circle(display_frame, (pos["x"], pos["y"]), 5, (0, 255, 0), 2)
 
+        # Draw purple dots
+        purple_dots = context.get("purple_dots", [])
+        for dot in purple_dots:
+            cv2.circle(display_frame, (dot["x"], dot["y"]), 3, (255, 0, 255), -1)
+
         status = "RUNNING" if self.running else "PAUSED"
         color = (0, 255, 0) if self.running else (0, 255, 255)
         cv2.putText(
@@ -661,12 +706,21 @@ class BotEngine:
             1,
         )
 
-        # Make window resizable and set larger size
+        # Show puzzle detection status
+        puzzle_detected = context.get("puzzle_icon", False)
+        if puzzle_detected:
+            cv2.putText(
+                display_frame,
+                "PUZZLE DETECTED!",
+                (10, 50),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 255, 0),
+                1,
+            )
+
         cv2.namedWindow("Bot Debug", cv2.WINDOW_NORMAL)
-
-        # Double the size: your minimap is 190x89, so make it 380x178
         cv2.resizeWindow("Bot Debug", 380, 178)
-
         cv2.imshow("Bot Debug", display_frame)
         cv2.waitKey(1)
 
