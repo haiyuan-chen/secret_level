@@ -156,6 +156,60 @@ class ColorDotDetector(Detector):
         return results
 
 
+class IconDetector(Detector):
+    def __init__(self, templates: List[str], threshold: float, region: Dict[str, int]):
+        self.templates = []
+        for template_path in templates:
+            try:
+                template = cv2.imread(template_path, cv2.IMREAD_GRAYSCALE)
+                if template is not None:
+                    self.templates.append(template)
+                    logging.info(f"Loaded puzzle icon template: {template_path}")
+                else:
+                    logging.warning(f"Failed to load icon template: {template_path}")
+            except Exception as e:
+                logging.error(f"Error loading icon template {template_path}: {e}")
+
+        self.threshold = threshold
+        self.region = region
+        self._sct = mss()
+
+    def name(self) -> str:
+        return "puzzle_icon"
+
+    def detect(self, frame: np.ndarray) -> bool:
+        """Returns True if puzzle icon is detected"""
+        if not self.templates:
+            return False
+
+        try:
+            # Capture the icon region (separate from minimap)
+            icon_frame = np.array(self._sct.grab(self.region))
+            gray = cv2.cvtColor(icon_frame, cv2.COLOR_BGRA2GRAY)
+
+            for template in self.templates:
+                if template is None:
+                    continue
+
+                th, tw = template.shape
+                h, w = gray.shape
+
+                if th > h or tw > w:
+                    continue
+
+                res = cv2.matchTemplate(gray, template, cv2.TM_CCOEFF_NORMED)
+                _, score, _, loc = cv2.minMaxLoc(res)
+
+                if score >= self.threshold:
+                    logging.info(f"🎯 Puzzle icon detected! (confidence: {score:.2f})")
+                    return True
+
+            return False
+        except Exception as e:
+            logging.error(f"Error detecting puzzle icon: {e}")
+            return False
+
+
 class Strategy(abc.ABC):
     @abc.abstractmethod
     def should_run(self, context: Dict[str, Any]) -> bool: ...
@@ -419,6 +473,17 @@ class BotEngine:
             cfg["dot_templates"], cfg["dot_threshold"]
         )
 
+        # ADD PUZZLE ICON DETECTOR HERE
+        if cfg.get("puzzle_icon_region"):
+            self.icon_detector = IconDetector(
+                cfg.get("puzzle_icon_templates", ["puzzle_icon_template.png"]),
+                cfg.get("puzzle_icon_threshold", 0.8),
+                cfg["puzzle_icon_region"],
+            )
+        else:
+            self.icon_detector = None
+            logging.warning("No puzzle icon region configured - navigation disabled")
+
         # Periodic detectors (every 3 frames)
         self.color_detectors = [
             ColorDotDetector("red_dots", cfg["red_hsv_lower"], cfg["red_hsv_upper"]),
@@ -528,6 +593,13 @@ class BotEngine:
                 # Always detect player position (every frame)
                 position = self.position_detector.detect(frame)
                 context["position"] = position
+
+                # ADD PUZZLE ICON DETECTION HERE
+                if self.icon_detector:
+                    puzzle_icon_detected = self.icon_detector.detect(frame)
+                    context["puzzle_icon"] = puzzle_icon_detected
+                else:
+                    context["puzzle_icon"] = False
 
                 # Detect colors every 3rd frame
                 if self.frame_count % 3 == 0:
